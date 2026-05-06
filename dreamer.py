@@ -330,7 +330,7 @@ class Dreamer(nn.Module):
             self.ema_update()
         metrics = {}
         with autocast(device_type=self.device.type, dtype=torch.float16):
-            (stoch, deter), mets = self._cal_grad(p_data, initial)
+            (stoch, deter, cr_per_step_loss), mets = self._cal_grad(p_data, initial)
         self._scaler.unscale_(self._optimizer)  # unscale grads in params
         if self.rep_loss == "dreamerpro" and self._ema_updates < self.freeze_prototypes_iters:
             self._prototypes.grad.zero_()
@@ -357,6 +357,8 @@ class Dreamer(nn.Module):
         metrics.update(mets)
         # update latent vectors in replay buffer
         replay_buffer.update(index, stoch.detach(), deter.detach())
+        # update Curious Replay priorities (no-op when not enabled)
+        replay_buffer.update_priority(index, cr_per_step_loss.detach())
         return metrics
 
     def _cal_grad(self, data, initial):
@@ -382,7 +384,9 @@ class Dreamer(nn.Module):
         post_stoch, post_deter, post_logit = self.rssm.observe(embed, data["action"], initial, data["is_first"])
         # (B, T, S, K)
         _, prior_logit = self.rssm.prior(post_deter)
+        # (B, T) per-step KL terms
         dyn_loss, rep_loss = self.rssm.kl_loss(post_logit, prior_logit, self.kl_free)
+        per_step_dyn = dyn_loss
         losses["dyn"] = torch.mean(dyn_loss)
         losses["rep"] = torch.mean(rep_loss)
         # === Representation / auxiliary losses ===
@@ -481,10 +485,17 @@ class Dreamer(nn.Module):
         else:
             raise NotImplementedError
 
-        # reward and continue
-        losses["rew"] = torch.mean(-self.reward(feat).log_prob(to_f32(data["reward"])))
+        # reward and continue (keep per-step versions for Curious Replay prioritization)
+        # (B, T)
+        per_step_rew = -self.reward(feat).log_prob(to_f32(data["reward"]))
         cont = 1.0 - to_f32(data["is_terminal"])
-        losses["con"] = torch.mean(-self.cont(feat).log_prob(cont))
+        per_step_con = -self.cont(feat).log_prob(cont)
+        losses["rew"] = torch.mean(per_step_rew)
+        losses["con"] = torch.mean(per_step_con)
+        # Per-transition world-model loss for Curious Replay (Eq. 1 of the CR paper). Use the
+        # |dyn + rew + con| signal, which is well-defined per (b, t) regardless of rep_loss
+        # (the NE/Barlow term is batchwise and would not give a per-transition signal).
+        cr_per_step_loss = (per_step_dyn + per_step_rew + per_step_con).abs().detach()
         # log
         metrics["dyn_entropy"] = torch.mean(self.rssm.get_dist(prior_logit).entropy())
         metrics["rep_entropy"] = torch.mean(self.rssm.get_dist(post_logit).entropy())
@@ -582,7 +593,7 @@ class Dreamer(nn.Module):
 
         metrics.update({f"loss/{name}": loss for name, loss in losses.items()})
         metrics.update({"opt/loss": total_loss})
-        return (post_stoch, post_deter), metrics
+        return (post_stoch, post_deter, cr_per_step_loss), metrics
 
     @torch.no_grad()
     def _imagine(self, start, imag_horizon):

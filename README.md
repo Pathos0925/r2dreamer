@@ -40,6 +40,28 @@ exposed as `model.nedreamer.use_transformer`, `model.nedreamer.use_shift`,
 and `model.nedreamer.use_projector`. The implementation plan is in
 [`docs/nedreamer_plan.md`](docs/nedreamer_plan.md).
 
+### Curious Replay
+
+[Curious Replay](https://arxiv.org/abs/2306.15934) (Kauvar & Doyle et al.,
+ICML 2023) is available as a prioritized sampling option, orthogonal to the
+choice of `rep_loss`. Enable with:
+
+```bash
+python3 train.py model.rep_loss=nedreamer model.curious_replay.enabled=True env=crafter
+```
+
+The buffer's per-transition priority follows Eq. 1 of the paper:
+
+```
+p_i = c * beta^v_i + (|L_i| + eps)^alpha
+```
+
+where `v_i` is the visit count and `L_i = |dyn + rew + cont|` is the
+per-step world-model loss (computed in `dreamer.py:_cal_grad` and threaded
+back through `buffer.update_priority`). All five `c, beta, alpha, eps,
+p_max` knobs are exposed under `model.curious_replay.*` with the paper's
+defaults.
+
 ### Validation: Atari-100k (size12M, 5 seeds collapsed to 1, 410k env steps each)
 
 Trained on a single A100 80GB; ~380 env-steps/sec with `model.compile=True`,

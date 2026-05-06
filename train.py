@@ -36,7 +36,7 @@ def main(config):
     # save config
     logger.log_hydra_config(config)
 
-    replay_buffer = Buffer(config.buffer)
+    replay_buffer = Buffer(config.buffer, curious_replay=config.model.curious_replay)
 
     print("Create envs.")
     train_envs, eval_envs, obs_space, act_space = make_envs(config.env)

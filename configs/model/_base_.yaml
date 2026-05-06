@@ -50,6 +50,17 @@ nedreamer:
     max_len: ${batch_length}
     act: ${model.act}
 
+curious_replay:
+  # Curious Replay (Kauvar & Doyle et al., 2023) — prioritized replay using
+  # p_i = c * beta^v_i + (|L_i| + eps)^alpha, with L = |dyn + rew + cont| per step.
+  # Defaults match the paper's hyperparameters.
+  enabled: False
+  c: 1e4
+  beta: 0.7
+  alpha: 0.7
+  eps: 0.01
+  p_max: 1e5
+
 dreamer_pro:
   warm_up: 1
   num_prototypes: 2500
