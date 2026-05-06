@@ -37,7 +37,20 @@ with a causal temporal transformer that predicts the next-step encoder
 embedding and aligns it to a stop-gradient target via Barlow Twins. Hyper-
 parameters live under `model.nedreamer.*`; the three Sec. 4.3 ablations are
 exposed as `model.nedreamer.use_transformer`, `model.nedreamer.use_shift`,
-and `model.nedreamer.use_projector`.
+and `model.nedreamer.use_projector`. The implementation plan is in
+[`docs/nedreamer_plan.md`](docs/nedreamer_plan.md).
+
+### Validation: Atari-100k (size12M, 5 seeds collapsed to 1, 410k env steps each)
+
+Trained on a single A100 80GB; ~380 env-steps/sec with `model.compile=True`,
+~25 minutes wall-clock per game. 3 eval episodes per checkpoint
+(`env.eval_episode_num=3`, `trainer.eval_every=2e4`).
+
+| Game     | Init eval | Best eval        | Final eval (400k) | Notes |
+|----------|-----------|------------------|-------------------|-------|
+| Pong     | -20.7     | **-11.3** @ 400k | **-11.3**         | Monotonic improvement; `loss/ne` 1025 → 40 |
+| Breakout |   0.0     | **7.3**  @ 380k  |   3.7             | Eval oscillates between scoring and the no-FIRE time-limit stall (a known Atari-100k Breakout pathology when `autostart: False`) |
+| Boxing   | -11.0     | **65.7** @ 380k  | **61.0**          | Strong learning; agent dominates the bot late in training |
 
 For easier code reading, inline tensor shape annotations are provided. See [`docs/tensor_shapes.md`](docs/tensor_shapes.md).
 
