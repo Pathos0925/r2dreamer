@@ -387,6 +387,129 @@ class Projector(nn.Module):
         return self.w(x)
 
 
+class CausalSelfAttention(nn.Module):
+    def __init__(self, hidden, heads):
+        super().__init__()
+        assert hidden % heads == 0
+        self.heads = heads
+        self.head_dim = hidden // heads
+        self.qkv = nn.Linear(hidden, 3 * hidden, bias=True)
+        self.out = nn.Linear(hidden, hidden, bias=True)
+
+    def forward(self, x):
+        # (B, T, C)
+        B, T, C = x.shape
+        qkv = self.qkv(x).reshape(B, T, 3, self.heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        # (B, H, T, D)
+        out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        # (B, T, H, D) -> (B, T, C)
+        out = out.transpose(1, 2).contiguous().reshape(B, T, C)
+        return self.out(out)
+
+
+class CausalTransformerBlock(nn.Module):
+    def __init__(self, hidden, heads, mlp_mult=4, act="SiLU"):
+        super().__init__()
+        act_cls = getattr(torch.nn, act)
+        self.norm1 = nn.RMSNorm(hidden, eps=1e-04, dtype=torch.float32)
+        self.attn = CausalSelfAttention(hidden, heads)
+        self.norm2 = nn.RMSNorm(hidden, eps=1e-04, dtype=torch.float32)
+        self.mlp = nn.Sequential(
+            nn.Linear(hidden, hidden * mlp_mult, bias=True),
+            act_cls(),
+            nn.Linear(hidden * mlp_mult, hidden, bias=True),
+        )
+
+    def forward(self, x):
+        x = x + self.attn(self.norm1(x))
+        x = x + self.mlp(self.norm2(x))
+        return x
+
+
+class StepMLPBlock(nn.Module):
+    """Per-step residual MLP block used by the *w/o transformer* ablation."""
+
+    def __init__(self, hidden, mlp_mult=4, act="SiLU"):
+        super().__init__()
+        act_cls = getattr(torch.nn, act)
+        self.norm = nn.RMSNorm(hidden, eps=1e-04, dtype=torch.float32)
+        self.mlp = nn.Sequential(
+            nn.Linear(hidden, hidden * mlp_mult, bias=True),
+            act_cls(),
+            nn.Linear(hidden * mlp_mult, hidden, bias=True),
+        )
+
+    def forward(self, x):
+        return x + self.mlp(self.norm(x))
+
+
+class NextEmbeddingPredictor(nn.Module):
+    """Causal next-embedding predictor for NE-Dreamer.
+
+    Takes per-step (stoch, deter, action) tokens and predicts encoder
+    embeddings via a causal temporal transformer. Supports the three
+    ablations from Sec. 4.3 of the paper:
+    - ``use_transformer=False`` swaps the transformer for per-step MLPs.
+    - ``use_projector=False`` reduces the input projector to a bare Linear.
+    """
+
+    def __init__(self, config, deter_size, flat_stoch, act_dim, embed_size):
+        super().__init__()
+        tcfg = config.transformer
+        self.use_transformer = bool(config.use_transformer)
+        self.use_projector = bool(config.use_projector)
+        in_dim = int(flat_stoch + deter_size + act_dim)
+        hidden = int(tcfg.hidden)
+        heads = int(tcfg.heads)
+        layers_n = int(tcfg.layers)
+        mlp_mult = int(tcfg.get("mlp_mult", 4))
+        self.max_len = int(tcfg.max_len)
+        act_name = str(tcfg.get("act", "SiLU"))
+        act_cls = getattr(torch.nn, act_name)
+
+        if self.use_projector:
+            self.proj = nn.Sequential(
+                nn.Linear(in_dim, hidden, bias=True),
+                nn.RMSNorm(hidden, eps=1e-04, dtype=torch.float32),
+                act_cls(),
+            )
+        else:
+            self.proj = nn.Linear(in_dim, hidden, bias=True)
+
+        self.pos_embed = nn.Parameter(torch.zeros(1, self.max_len, hidden))
+
+        if self.use_transformer:
+            self.blocks = nn.ModuleList([
+                CausalTransformerBlock(hidden, heads, mlp_mult=mlp_mult, act=act_name) for _ in range(layers_n)
+            ])
+        else:
+            self.blocks = nn.ModuleList([StepMLPBlock(hidden, mlp_mult=mlp_mult, act=act_name) for _ in range(layers_n)])
+
+        self.norm_out = nn.RMSNorm(hidden, eps=1e-04, dtype=torch.float32)
+        self.head = nn.Linear(hidden, embed_size, bias=True)
+
+        self.apply(weight_init_)
+
+    def forward(self, stoch, deter, action):
+        # stoch: (B, T, S, K) or (B, T, S*K), deter: (B, T, D), action: (B, T, A)
+        B, T = deter.shape[:2]
+        if stoch.dim() == 4:
+            stoch = stoch.reshape(B, T, -1)
+        # Action magnitude normalization mirrors RSSM's Deter input handling.
+        action = action / torch.clip(torch.abs(action), min=1.0).detach()
+        # (B, T, S*K + D + A)
+        x = torch.cat([stoch, deter, action], dim=-1)
+        # (B, T, hidden)
+        x = self.proj(x)
+        x = x + self.pos_embed[:, :T]
+        for blk in self.blocks:
+            x = blk(x)
+        x = self.norm_out(x)
+        # (B, T, E)
+        return self.head(x)
+
+
 class ReturnEMA(nn.Module):
     """running mean and std"""
 

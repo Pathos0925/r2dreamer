@@ -90,6 +90,19 @@ class Dreamer(nn.Module):
             self.prj = Projector(self.rssm.feat_size, self.embed_size)
             modules.update({"projector": self.prj})
             self.barlow_lambd = float(config.r2dreamer.lambd)
+        elif self.rep_loss == "nedreamer":
+            # NE-Dreamer: causal temporal transformer that predicts the next-step encoder embedding.
+            necfg = config.nedreamer
+            self.use_shift = bool(necfg.use_shift)
+            self.barlow_lambd = float(necfg.barlow_lambd)
+            self.ne_predictor = networks.NextEmbeddingPredictor(
+                necfg,
+                self.rssm._deter,
+                self.rssm.flat_stoch,
+                self.act_dim,
+                self.embed_size,
+            )
+            modules.update({"ne_predictor": self.ne_predictor})
         elif self.rep_loss == "dreamerpro":
             dpc = config.dreamer_pro
             self.warm_up = int(dpc.warm_up)
@@ -406,6 +419,48 @@ class Dreamer(nn.Module):
             norm_logits = logits - torch.max(logits, 1)[0][:, None]
             labels = torch.arange(norm_logits.shape[0]).long().to(self.device)
             losses["infonce"] = torch.nn.functional.cross_entropy(norm_logits, labels)
+        elif self.rep_loss == "nedreamer":
+            # NE-Dreamer: predict next-step encoder embedding from history with a causal transformer,
+            # then align the prediction to a stop-gradient target via Barlow Twins (Eqs. 8-12 of paper).
+            # In `data`, action[:, t] is the action that produced data[:, t] (i.e. a_{t-1});
+            # so action[:, t+1] is a_t — the action at position t in paper notation.
+            if self.use_shift:
+                # Predict e_{t+1} from token at position t built from (z_t, h_t, a_t).
+                stoch_in = post_stoch[:, :-1]
+                deter_in = post_deter[:, :-1]
+                action_in = data["action"][:, 1:]
+                ne_pred = self.ne_predictor(stoch_in, deter_in, action_in)  # (B, T-1, E)
+                ne_target = embed[:, 1:].detach()
+                # Mask out cross-episode pairs (defensive; SliceSampler usually keeps a single episode).
+                valid = (~data["is_first"][:, 1:]).to(ne_pred.dtype)  # (B, T-1)
+            else:
+                # No-shift ablation: align ê_t with e_t (per-timestep matching, like R2-Dreamer).
+                ne_pred = self.ne_predictor(post_stoch, post_deter, data["action"])  # (B, T, E)
+                ne_target = embed.detach()
+                valid = torch.ones(B, T, device=ne_pred.device, dtype=ne_pred.dtype)
+
+            E_dim = ne_pred.shape[-1]
+            # (B*Tp, E)
+            pred_flat = ne_pred.reshape(-1, E_dim)
+            target_flat = ne_target.reshape(-1, E_dim)
+            # (B*Tp, 1)
+            w = valid.reshape(-1, 1)
+            n_eff = w.sum().clamp(min=1.0)
+
+            # Weighted per-dimension standardization (Barlow Twins).
+            mean1 = (pred_flat * w).sum(0, keepdim=True) / n_eff
+            mean2 = (target_flat * w).sum(0, keepdim=True) / n_eff
+            var1 = ((pred_flat - mean1).pow(2) * w).sum(0, keepdim=True) / n_eff
+            var2 = ((target_flat - mean2).pow(2) * w).sum(0, keepdim=True) / n_eff
+            x1n = (pred_flat - mean1) / (var1.sqrt() + 1e-8)
+            x2n = (target_flat - mean2) / (var2.sqrt() + 1e-8)
+
+            # (E, E) cross-correlation, weighted by validity.
+            c = (x1n * w).T @ x2n / n_eff
+            invariance = (torch.diagonal(c) - 1.0).pow(2).sum()
+            off_diag_mask = ~torch.eye(E_dim, dtype=torch.bool, device=c.device)
+            redundancy = c[off_diag_mask].pow(2).sum()
+            losses["ne"] = invariance + self.barlow_lambd * redundancy
         elif self.rep_loss == "dreamerpro":
             # DreamerPro uses augmentation + EMA targets + Sinkhorn assignment.
             with torch.no_grad():
