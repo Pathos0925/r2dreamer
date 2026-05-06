@@ -28,9 +28,16 @@ Switching algorithms:
 
 ```bash
 # Choose an algorithm via model.rep_loss:
-# r2dreamer|dreamer|infonce|dreamerpro
+# r2dreamer|dreamer|infonce|dreamerpro|nedreamer
 python3 train.py model.rep_loss=r2dreamer
 ```
+
+`nedreamer` (NE-Dreamer, Bredis et al., 2026) replaces the pixel decoder
+with a causal temporal transformer that predicts the next-step encoder
+embedding and aligns it to a stop-gradient target via Barlow Twins. Hyper-
+parameters live under `model.nedreamer.*`; the three Sec. 4.3 ablations are
+exposed as `model.nedreamer.use_transformer`, `model.nedreamer.use_shift`,
+and `model.nedreamer.use_projector`.
 
 For easier code reading, inline tensor shape annotations are provided. See [`docs/tensor_shapes.md`](docs/tensor_shapes.md).
 
